@@ -4,6 +4,7 @@ import asyncio
 import struct
 import logging
 import functools
+import math
 
 CONNECT=0b0001
 CONNACK=0b0010
@@ -17,21 +18,22 @@ DISCONNECT=0b1110
 UNSUBSCRIBE=0b1010
 UNSUBACK=0b1011
 
-def writeLengthPrefixedString(writer, s):
-    writer.write(struct.pack('!H', len(s)) + s.encode('utf-8'))
+def writeLengthPrefixedBytes(writer, data):
+    writer.write(struct.pack('!H', len(data)))
+    writer.write(data)
 
-def decodeLengthPrefixedString(b):
-    l, = struct.unpack('!H', b[0:2])
-    return b[2:2+l].decode('utf-8')    
+def decodeLengthPrefixedBytes(data, i):
+    l, = struct.unpack_from('!H', data, offset=i)
+    return data[2:2+l]
 
 def writeRemaining(writer, l):
     while True:
         byte = l % 128
         l = l // 128
-        if l > 0:
+        if(l > 0):
             byte |= 0x80
         writer.write(struct.pack('B', byte))
-        if l == 0:
+        if(l == 0):
             return
 
 async def decodeRemaining(reader):
@@ -42,38 +44,84 @@ async def decodeRemaining(reader):
         byte, = struct.unpack('!B', byte)
         remaining += (byte & 127) * mult 
         mult = mult * 128
-        if byte & 128 == 0:
+        if((byte & 128) == 0):
             return remaining
 
 class ConnectMsg:
 
     def __init__(self):
         self.clientId = None
+        self.username = None
+        self.password = None
+        self.will = None
+        self.willTopic = None
+        self.willQos = 0
+        self.willRetain = False
+        self.clean = False
+        self.protocolName = 'MQTT'
+        self.protocolLevel = 4
+        self.keepAlive = 600
 
     def __str__(self):
-        return 'Connect'
+        return 'Connect[clientId=%s, username=%s, willTopic=%s, willQos=%s, willRetain=%s, clean=%s, protocolName=%s, protocolLevel=%s, keepAlive=%s' % (
+            self.clientId, self.username, self.willTopic, self.willQos, self.willRetain, self.clean, self.protocolName, self.protocolLevel, self.keepAlive)
 
     def write(self, writer):
-        writer.write(struct.pack('B', CONNECT << 4))
+        if((self.username is None) and (not self.password is None)):
+            raise Exception("Password requires username")
 
-        if(self.clientId is None):
-            clientId = ""
-        else:
-            clientId = self.clientId
+        if((self.will is None) and (not self.willTopic is None)):
+            raise Exception("willTopic requires will")
 
-        remaining = 6 # var.protocolName
+        if((self.willTopic is None) and (not self.will is None)):
+            raise Exception("will requires willTopic")
+
+        clientId = ("" if self.clientId is None else self.clientId).encode('utf-8')
+        protocolName = self.protocolName.encode('utf-8')
+        will = None if self.will is None else self.will.encode('utf-8')
+        willTopic = None if self.willTopic is None else self.willTopic.encode('utf-8')
+        username = None if self.username is None else self.username.encode('utf-8')
+
+        connectFlags = 0
+        remaining = 2 + len(protocolName) # var.protocolName
         remaining += 1 # var.protocolLevel
         remaining += 1 # var.connectFlags
         remaining += 2 # var.keepAlive
         remaining += 2 + len(clientId) # pay.clientId
+        if(not will is None):
+            connectFlags |= 0b100
+            connectFlags |= 0b100000 if self.willRetain else 0b0
+            connectFlags |= self.willQos << 3
+            remaining += 2 + len(willTopic) # pay.willTopic
+            remaining += 2 + len(will) # pay.will
+        if(not username is None):
+            connectFlags |= 0b10000000
+            remaining += 2 + len(username) # pay.username
+        if(not self.password is None):
+            connectFlags |= 0b1000000
+            remaining += 2 + len(self.password) # pay.password
+        if(self.clean):
+            connectFlags |= 0b10
+
+        # header
+        writer.write(struct.pack('B', CONNECT << 4))
         writeRemaining(writer, remaining)
 
-        writeLengthPrefixedString(writer, 'MQTT')
-        writer.write(struct.pack('B', 0b100))
-        writer.write(struct.pack('B', 0b10))
-        writer.write(struct.pack('!H', 600))
+        # variable
+        writeLengthPrefixedBytes(writer, protocolName)
+        writer.write(struct.pack('B', self.protocolLevel))
+        writer.write(struct.pack('B', connectFlags))
+        writer.write(struct.pack('!H', self.keepAlive))
 
-        writeLengthPrefixedString(writer, clientId)
+        # payload
+        writeLengthPrefixedBytes(writer, clientId)
+        if(not will is None):
+            writeLengthPrefixedBytes(writer, willTopic)
+            writeLengthPrefixedBytes(writer, will)
+        if(not username is None):
+            writeLengthPrefixedBytes(writer, username)
+        if(not self.password is None):
+            writeLengthPrefixedBytes(writer, self.password)
 
 class ConnAckMsg:
 
@@ -99,17 +147,24 @@ class UnsubscribeMsg:
         self.packetId = None
 
     def write(self, writer):
-        writer.write(struct.pack('B', (UNSUBSCRIBE << 4) | 0b10))
 
         remaining = 2 # var.packetId
-        for topicFilter in self.topicFilters:
+        topicFilters = []
+        for rawTopicFilter in self.topicFilters:
+            topicFilter = rawTopicFilter.encode('utf-8')
+            topicFilters.append(topicFilter)
             remaining += 2 + len(topicFilter) # pay.topicFilter
+
+        # header
+        writer.write(struct.pack('B', (UNSUBSCRIBE << 4) | 0b10))
         writeRemaining(writer, remaining)
 
+        # variable
         writer.write(struct.pack('!H', self.packetId))
 
-        for topicFilter in self.topicFilters:
-            writeLengthPrefixedString(writer, topicFilter)
+        # payload
+        for topicFilter in topicFilters:
+            writeLengthPrefixedBytes(writer, topicFilter)
 
     def __str__(self):
         return 'Unsubscribe[packetId=%s, topicFilters=%s]' % (self.packetId, self.subs)
@@ -126,7 +181,7 @@ class UnsubAckMsg:
     def decode(header, remaining, data):
         unsubAck = UnsubAckMsg()
         
-        unsubAck.packetId, = struct.unpack('!H', data[0:2])
+        unsubAck.packetId, = struct.unpack('!H', data)
 
         return unsubAck
 
@@ -137,18 +192,25 @@ class SubscribeMsg:
         self.packetId = None
 
     def write(self, writer):
-        writer.write(struct.pack('B', (SUBSCRIBE << 4) | 0b10))
 
         remaining = 2 # var.packetId
-        for (topicFilter, qos) in self.subs:
+        subs = []
+        for (rawTopicFilter, qos) in self.subs:
+            topicFilter = rawTopicFilter.encode('utf-8')
+            subs.append((topicFilter, qos,))
             remaining += 2 + len(topicFilter) # pay.topicFilter
             remaining += 1 # pay.qos
+
+        # header
+        writer.write(struct.pack('B', (SUBSCRIBE << 4) | 0b10))
         writeRemaining(writer, remaining)
 
+        # variable
         writer.write(struct.pack('!H', self.packetId))
 
-        for (topicFilter, qos) in self.subs:
-            writeLengthPrefixedString(writer, topicFilter)
+        # payload
+        for (topicFilter, qos) in subs:
+            writeLengthPrefixedBytes(writer, topicFilter)
             writer.write(struct.pack('B', qos))
 
     def __str__(self):
@@ -167,9 +229,13 @@ class SubAckMsg:
     def decode(header, remaining, data):
         subAck = SubAckMsg()
 
-        subAck.packetId, = struct.unpack('!H', data[0:2])
-        for x in range(remaining - 2):
-            subAck.returnCodes.append(data[x + 2])
+        i = 0
+
+        subAck.packetId, = struct.unpack_from('!H', data, offset=i)
+        i += 2
+
+        for x in range(i, remaining):
+            subAck.returnCodes.append(data[x])
 
         return subAck
 
@@ -187,18 +253,23 @@ class PublishMsg:
         dup = 0b1000 if self.dup else 0b0
         retain = 0b1 if self.retain else 0b0
         qos = self.qos << 1
-        writer.write(struct.pack('B', (PUBLISH << 4) | dup | qos | retain))
+        topic = self.topic.encode('utf-8')
 
-        remaining = 2 + len(self.topic) # var.topic
-        if qos > 0:
+        remaining = 2 + len(topic) # var.topic
+        if(qos > 0):
             remaining += 2 # var.packetId
         remaining += len(self.payload) # pay.payload
+
+        # header
+        writer.write(struct.pack('B', (PUBLISH << 4) | dup | qos | retain))
         writeRemaining(writer, remaining)
 
-        writeLengthPrefixedString(writer, self.topic)
-        if qos > 0:
+        # variable
+        writeLengthPrefixedBytes(writer, topic)
+        if(qos > 0):
             writer.write(struct.pack('!H', self.packetId))
 
+        # payload
         writer.write(self.payload)
 
     def __str__(self):
@@ -212,12 +283,13 @@ class PublishMsg:
         pub.retain = (header & 0b1) == 0b1
         pub.qos = (header & 0b110) >> 1
         
-        pub.topic = decodeLengthPrefixedString(data)
-        i = len(pub.topic) + 2
+        i = 0
+        pub.topic = decodeLengthPrefixedBytes(data, i).decode('utf-8')
+        i += len(pub.topic) + 2
 
-        if pub.qos > 0:
-            pub.packetId, = struct.unpack('!H', data[i:i+2])
-            i = i + 2
+        if(pub.qos > 0):
+            pub.packetId, = struct.unpack_from('!H', data, offset=i)
+            i += 2
 
         pub.payload = data[i:]
 
@@ -245,6 +317,7 @@ class PingReqMsg:
         return 'PingReq'
 
     def write(self, writer):
+        # header
         writer.write(struct.pack('BB', PINGREQ << 4, 0))
 
 class PingRespMsg:
@@ -254,8 +327,7 @@ class PingRespMsg:
 
     @staticmethod
     def decode(header, remaining, data):
-        pingResp = PingRespMsg()
-        return pingResp
+        return PingRespMsg()
 
 class DisconnectMsg:
 
@@ -263,96 +335,128 @@ class DisconnectMsg:
         return 'Disconnect'
 
     def write(self, writer):
+        # header
         writer.write(struct.pack('BB', DISCONNECT << 4, 0))
+
+decoders = 0x10 * [None]
+decoders[CONNACK] = ConnAckMsg.decode
+decoders[SUBACK] = SubAckMsg.decode
+decoders[PUBACK] = PubAckMsg.decode
+decoders[PUBLISH] = PublishMsg.decode
+decoders[PINGRESP] = PingRespMsg.decode
+decoders[UNSUBACK] = UnsubAckMsg.decode
 
 class Timers:
 
-    def __init__(self, loop=None):
-        if(loop is None):
-            self.loop = asyncio.get_event_loop()
-        else:
-            self.loop = loop
-        self.timers = {}
+    def __init__(self, loop):
+        self._loop = loop
+        self._timers = {}
 
     def create(self, _id, delay, callback):
-        if(_id in self.timers):
+        if(_id in self._timers):
             raise Exception("Timer already defined: %s" % _id)
 
-        def fired(_id, callback):
+        def fired():
             try:
-                del self.timers[_id]
+                del self._timers[_id]
                 callback()
             except Exception as e:
-                logging.error(e)
+                logging.exception(e)
                 raise
 
-        timer = self.loop.call_later(delay, fired, _id, callback)
-        self.timers[_id] = timer
+        timer = self._loop.call_later(delay, fired)
+        self._timers[_id] = timer
 
-    def cancel(self, _id):
-        if(not _id in self.timers):
+    def cancel(self, _id, ignoreMissing=False):
+        if(not _id in self._timers):
+            if(ignoreMissing):
+                return
             raise Exception("Unknown timer: %s" % _id)
-        timer = self.timers[_id]
-        del self.timers[_id]
+        timer = self._timers[_id]
+        del self._timers[_id]
         timer.cancel() 
 
-    def reset(self):
-        ids = list(self.timers.keys())
-        for _id in ids:
+    def cancelAll(self):
+        for _id in self._timers.keys[:]:
             self.cancel(_id)
 
 class Acker:
 
-    def __init__(self, loop=None):
-        if(loop is None):
-            self.loop = asyncio.get_event_loop()
-        else:
-            self.loop = loop
-        self.acks = {}
+    def __init__(self, limits, loop):
+        self._loop = loop
+        self._limits = limits
+        self._acks = {}
+        self._used = bytearray(math.ceil(limits.ackLimit / 8))
+
+        # next id to try after previously found one
+        self._packetId = 0
 
     def create(self, callback):
-        for x in range(1000):
-            if(not x in self.acks):
-                ack = self.loop.create_future()
-                ack.id = x
-                ack.add_done_callback(callback)
-                self.acks[x] = ack
-                return ack
-        raise Exception("Ack exhaustion")
+        packetId = self._claimPacketId()
+        ack = self._loop.create_future()
+        ack.id = packetId
+        ack.add_done_callback(callback)
+        self._acks[packetId] = ack
+        return ack
+
+    def _claimPacketId(self):
+        attempt = 0
+        while(True):
+            if(self._packetId >= self._limits.ackLimit):
+                self._packetId = 0
+
+            i = math.floor(self._packetId / 8)
+            mask = 1 << (self._packetId % 8)
+
+            if((self._used[i] & mask) == 0):
+                self._used[i] |= mask
+                break
+
+            self._packetId += 1
+
+            attempt += 1
+            if(attempt >= self._limits.ackLimit):
+                raise Exception("Ack exchaustion")
+
+        packetId = self._packetId
+        self._packetId += 1
+        return packetId
+
+    def _freePacketId(self, packetId):
+        i = math.floor(packetId / 8)
+        mask = (1 << (packetId % 8)) ^ 0xFF
+        self._used[i] &= mask
 
     def complete(self, _id, msg, ignoreMissing=False):
-        if(not _id in self.acks):
+        if(not _id in self._acks):
             if(ignoreMissing):
                 return
             raise Exception("Unknown ack: %s" % _id)
-        ack = self.acks[_id]
-        del self.acks[_id]
-        try:
-            ack.set_result(msg)
-        except Exception as e:
-            logging.error(e)
-            raise
+        ack = self._acks[_id]
+        del self._acks[_id]
+        self._freePacketId(ack.id)
+        ack.set_result(msg)
 
     def cancel(self, _id):
-        if(not _id in self.acks):
+        if(not _id in self._acks):
             raise Exception("Unknown ack: %s" % _id)
-        ack = self.acks[_id]
-        del self.acks[_id]
+        ack = self._acks[_id]
+        del self._acks[_id]
+        self._freePacketId(ack.id)
         ack.cancel()
 
-    def reset(self):
-        ackIds = list(self.acks.keys())
-        for _id in ackIds:
+    def cancelAll(self):
+        for _id in self._acks.keys()[:]:
             self.cancel(_id)
 
 # attempt is 0 based, attempt 0 is first time we are sending it
 class SimpleRetryPolicy:
 
     def __init__(self, delay):
-        self.delay = delay
+        self._delay = delay
 
     def getAckTimeout(self, attempt):
-        return self.delay
+        return self._delay
 
     def shouldRetry(self, attempt):
         return True
@@ -360,73 +464,72 @@ class SimpleRetryPolicy:
 class SimpleConnectPolicy:
 
     def __init__(self, delay):
-        self.delay = delay
+        self._delay = delay
 
     def getAckTimeout(self):
-        return self.delay
+        return self._delay
 
     def getRestTime(self):
-        return self.delay
+        return self._delay
+
+class SimpleLimits:
+
+    def __init__(self, ackLimit):
+        self.ackLimit = ackLimit
 
 # need defined outstanding qos1 message limit
 # need defined outstanding subscribe message limit
 # need defined outstanding unsubscribe message limit
 class MqttSession:
 
-    def __init__(self, host, port, sslcontext=None, clientId=None, handler=None, loop=None):
-        self.host = host
-        self.port = port
-        self.sslcontext = sslcontext
-        self.clientId = clientId
+    def __init__(self, connector, handler, loop=None):
+        self.connector = connector
         self.handler = handler
-        if(loop is None):
-            self.loop = asyncio.get_event_loop()
-        else:
-            self.loop = loop
+        self._loop = asyncio.get_event_loop() if loop is None else loop
 
-        self.decoders = 0x10 * [None]
-        self.decoders[CONNACK] = ConnAckMsg.decode
-        self.decoders[SUBACK] = SubAckMsg.decode
-        self.decoders[PUBACK] = PubAckMsg.decode
-        self.decoders[PUBLISH] = PublishMsg.decode
-        self.decoders[PINGRESP] = PingRespMsg.decode
-        self.decoders[UNSUBACK] = UnsubAckMsg.decode
-
-        retryPolicy = SimpleRetryPolicy(5)
-        self.publishRetryPolicy = retryPolicy
-        self.subscribeRetryPolicy = retryPolicy 
-        self.unsubscribeRetryPolicy = retryPolicy
+        defaultRetryPolicy = SimpleRetryPolicy(5)
+        self.publishRetryPolicy = defaultRetryPolicy
+        self.subscribeRetryPolicy = defaultRetryPolicy 
+        self.unsubscribeRetryPolicy = defaultRetryPolicy
 
         self.connectPolicy = SimpleConnectPolicy(5)
 
         self.pingPeriod = 600
 
-        self.timers = Timers()
-        self.acker = Acker()
+        defaultLimits = SimpleLimits(100)
+        self.limits = defaultLimits
+
+        self.timers = Timers(loop)
+        self.acker = Acker(self.limits, loop)
 
     def start(self):
-        self.sessionLoop = self.loop.create_task(self.__start())
+        self.sessionLoop = self._loop.create_task(self.__start())
         return self.sessionLoop
 
     async def __start(self):
-        while not self.loop.is_closed():
+        while not self._loop.is_closed():
+            self.writer = None
             try:
-                (self.reader, self.writer) = await asyncio.open_connection(self.host, self.port, ssl=self.sslcontext)
+                (self.reader, self.writer) = await self.connector()
                 self.__connect()
                 await self.__loop()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logging.error(e)
-                await asyncio.sleep(self.connectPolicy.getRestTime())
+                logging.exception(e)
             finally:
-                self.timers.reset()
-                self.acker.reset()
+                if(not self.writer is None):
+                    self.writer.close()
+        
+                # cancelling all acks will also cancel all ack timers
+                # so to prevent unknown timer exceptions cancel them first
+                self.acker.cancelAll()
+                self.timers.cancelAll()
+
+            await asyncio.sleep(self.connectPolicy.getRestTime())
 
     def __connect(self):
-        logging.info("Connecting")
-        connect = ConnectMsg()
-        connect.clientId = self.clientId
+        connect = self.handler.connecting()
 
         def timedOut():
             logging.error("Connect timed out")
@@ -440,7 +543,6 @@ class MqttSession:
         self.writer.close()
 
     def __disconnect(self):
-        logging.info("Disconnecting")
         disconnect = DisconnectMsg()
         self.__write(disconnect)
 
@@ -453,10 +555,10 @@ class MqttSession:
                 remaining = await decodeRemaining(self.reader)
                 data = await self.reader.readexactly(remaining)
                 msgType = header >> 4
-                msg = self.decoders[msgType](header, remaining, data)
+                msg = decoders[msgType](header, remaining, data)
                 if(isinstance(msg, ConnAckMsg)):
                     self.timers.cancel("connect")
-                    pingerTask = self.loop.create_task(self.__pinger())
+                    pingerTask = self._loop.create_task(self.__pinger())
                     self.handler.connected(msg)
                 elif(isinstance(msg, SubAckMsg)):
                     self.acker.complete(msg.packetId, msg, ignoreMissing=True)
@@ -475,47 +577,52 @@ class MqttSession:
             while True:
                 self.__write(PingReqMsg())
                 await asyncio.sleep(self.pingPeriod)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            logging.error(e)
-            raise
+            logging.exception(e)
 
     def __write(self, msg):
         msg.write(self.writer) 
 
-    def stop(self):
+    async def stop(self):
         try:
             self.__disconnect()
+            await self.writer.drain()
         except Exception as e:
-            logging.error(e)
+            logging.exception(e)
         self.sessionLoop.cancel()
 
     def __ackable(self, msg, retryPolicy, callback=None):
 
-        def acked(callback, ack):
-            self.timers.cancel(ack.id)
+        def acked(ack):
+            self.timers.cancel(ack.id, ignoreMissing=True)
             if(not callback is None):
-                callback(self)
+                callback(self, ack)
 
-        def timedOut(retryPolicy, msg, packetId, attempt):
-            if(not retryPolicy.shouldRetry(attempt)):
-                self.acker.cancel(packetId)
-                self.__disconnect()
-            self.timers.create(packetId, retryPolicy.getAckTimeout(attempt), functools.partial(timedOut, retryPolicy, msg, packetId, attempt + 1))
-            self.__write(msg)
+        def timedOut(packetId, attempt):
+            if(retryPolicy.shouldRetry(attempt)):
+                self.timers.create(packetId, retryPolicy.getAckTimeout(attempt), functools.partial(timedOut, packetId, attempt + 1))
+                self.__write(msg)
+            else:
+                logging.error("Ack timed out, retries exhausted: %s" % packetId)
+                self.__close()
 
-        ack = self.acker.create(functools.partial(acked, callback))
+        ack = self.acker.create(acked)
         msg.packetId = ack.id
-        self.timers.create(ack.id, retryPolicy.getAckTimeout(0), functools.partial(timedOut, retryPolicy, msg, ack.id, 1))
+        self.timers.create(ack.id, retryPolicy.getAckTimeout(0), functools.partial(timedOut, ack.id, 1))
 
         self.__write(msg)
 
         return ack
 
-    def publish(self, topic, qos, payload, callback=None):
+    def publish(self, topic, qos, payload, dup=False, retain=False, callback=None):
         publish = PublishMsg()
         publish.topic = topic
         publish.qos = qos
         publish.payload = payload
+        publish.dup = dup
+        publish.retain = retain
 
         if(publish.qos == 0):
             self.__write(publish)
