@@ -303,6 +303,16 @@ class PubAckMsg:
     def __str__(self):
         return 'PubAck[packetId=%s]' % self.packetId
 
+    def write(self, writer):
+        remaining = 2 # var.packetId
+
+        # header
+        writer.write(struct.pack('B', PUBACK << 4))
+        writeRemaining(writer, remaining)
+
+        # variable
+        writer.write(struct.pack('!H', self.packetId))
+
     @staticmethod
     def decode(header, remaining, data):
         pubAck = PubAckMsg()
@@ -377,7 +387,7 @@ class Timers:
         timer.cancel() 
 
     def cancelAll(self):
-        for _id in self._timers.keys[:]:
+        for _id in list(self._timers.keys):
             self.cancel(_id)
 
 class Acker:
@@ -446,7 +456,7 @@ class Acker:
         ack.cancel()
 
     def cancelAll(self):
-        for _id in self._acks.keys()[:]:
+        for _id in list(self._acks.keys()):
             self.cancel(_id)
 
 # attempt is 0 based, attempt 0 is first time we are sending it
