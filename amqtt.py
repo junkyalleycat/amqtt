@@ -387,7 +387,7 @@ class Timers:
         timer.cancel() 
 
     def cancelAll(self):
-        for _id in list(self._timers.keys):
+        for _id in list(self._timers.keys()):
             self.cancel(_id)
 
 class Acker:
@@ -437,7 +437,7 @@ class Acker:
         mask = (1 << (packetId % 8)) ^ 0xFF
         self._used[i] &= mask
 
-    def complete(self, _id, msg, ignoreMissing=False):
+    def complete(self, _id, result=None, exception=None, ignoreMissing=False):
         if(not _id in self._acks):
             if(ignoreMissing):
                 return
@@ -445,7 +445,11 @@ class Acker:
         ack = self._acks[_id]
         del self._acks[_id]
         self._freePacketId(ack.id)
-        ack.set_result(msg)
+
+        if(not result is None):
+            ack.set_result(result)
+        if(not exception is None):
+            ack.set_exception(exception)
 
     def cancel(self, _id):
         if(not _id in self._acks):
@@ -487,42 +491,44 @@ class SimpleLimits:
     def __init__(self, ackLimit):
         self.ackLimit = ackLimit
 
+class AckTimeoutException:
+
+    pass
+
 # need defined outstanding qos1 message limit
 # need defined outstanding subscribe message limit
 # need defined outstanding unsubscribe message limit
 class MqttSession:
 
     def __init__(self, connector, handler, loop=None):
-        self.connector = connector
-        self.handler = handler
+        self._connector = connector
+        self._handler = handler
         self._loop = asyncio.get_event_loop() if loop is None else loop
 
-        defaultRetryPolicy = SimpleRetryPolicy(5)
-        self.publishRetryPolicy = defaultRetryPolicy
-        self.subscribeRetryPolicy = defaultRetryPolicy 
-        self.unsubscribeRetryPolicy = defaultRetryPolicy
+        self.defaultRetryPolicy = SimpleRetryPolicy(5)
+        self.publishRetryPolicy = self.defaultRetryPolicy
+        self.subscribeRetryPolicy = self.defaultRetryPolicy 
+        self.unsubscribeRetryPolicy = self.defaultRetryPolicy
 
         self.connectPolicy = SimpleConnectPolicy(5)
 
         self.pingPeriod = 600
 
-        defaultLimits = SimpleLimits(100)
-        self.limits = defaultLimits
+        self.limits = SimpleLimits(100)
 
-        self.timers = Timers(loop)
-        self.acker = Acker(self.limits, loop)
+        self._timers = Timers(loop)
+        self._acker = Acker(self.limits, loop)
 
-    def start(self):
-        self.sessionLoop = self._loop.create_task(self.__start())
+    def connect(self, connect):
+        self.sessionLoop = self._loop.create_task(self.__start(connect))
         return self.sessionLoop
 
-    async def __start(self):
+    async def __start(self, connect):
         while not self._loop.is_closed():
             self.writer = None
             try:
-                (self.reader, self.writer) = await self.connector()
-                self.__connect()
-                await self.__loop()
+                (self.reader, self.writer) = await self._connector()
+                await self.__loop(connect)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -533,21 +539,10 @@ class MqttSession:
         
                 # cancelling all acks will also cancel all ack timers
                 # so to prevent unknown timer exceptions cancel them first
-                self.acker.cancelAll()
-                self.timers.cancelAll()
+                self._acker.cancelAll()
+                self._timers.cancelAll()
 
             await asyncio.sleep(self.connectPolicy.getRestTime())
-
-    def __connect(self):
-        connect = self.handler.connecting()
-
-        def timedOut():
-            logging.error("Connect timed out")
-            self.__close()
-
-        self.timers.create("connect", self.connectPolicy.getAckTimeout(), timedOut)
-
-        self.__write(connect)
 
     def __close(self):
         self.writer.close()
@@ -556,7 +551,22 @@ class MqttSession:
         disconnect = DisconnectMsg()
         self.__write(disconnect)
 
-    async def __loop(self):
+    async def stop(self):
+        try:
+            self.__disconnect()
+            await self.writer.drain()
+        except Exception as e:
+            logging.exception(e)
+        self.sessionLoop.cancel()
+
+    async def __loop(self, connect):
+        def connectTimedOut():
+            logging.error("Connect timed out")
+            self.__close()
+
+        self._timers.create("connect", self.connectPolicy.getAckTimeout(), connectTimedOut)
+        self.__write(connect)
+
         pingerTask = None
         try:
             while True:
@@ -567,17 +577,17 @@ class MqttSession:
                 msgType = header >> 4
                 msg = decoders[msgType](header, remaining, data)
                 if(isinstance(msg, ConnAckMsg)):
-                    self.timers.cancel("connect")
+                    self._timers.cancel("connect")
                     pingerTask = self._loop.create_task(self.__pinger())
-                    self.handler.connected(msg)
+                    self._handler.connected(msg)
                 elif(isinstance(msg, SubAckMsg)):
-                    self.acker.complete(msg.packetId, msg, ignoreMissing=True)
+                    self._acker.complete(msg.packetId, result=msg, ignoreMissing=True)
                 elif(isinstance(msg, UnsubAckMsg)):
-                    self.acker.complete(msg.packetId, msg, ignoreMissing=True)
+                    self._acker.complete(msg.packetId, result=msg, ignoreMissing=True)
                 elif(isinstance(msg, PubAckMsg)):
-                    self.acker.complete(msg.packetId, msg, ignoreMissing=True)
+                    self._acker.complete(msg.packetId, result=msg, ignoreMissing=True)
                 elif(isinstance(msg, PublishMsg)):
-                    self.handler.received(msg)
+                    self._handler.received(msg)
         finally:
             if(not pingerTask is None):
                 pingerTask.cancel()
@@ -595,32 +605,23 @@ class MqttSession:
     def __write(self, msg):
         msg.write(self.writer) 
 
-    async def stop(self):
-        try:
-            self.__disconnect()
-            await self.writer.drain()
-        except Exception as e:
-            logging.exception(e)
-        self.sessionLoop.cancel()
-
     def __ackable(self, msg, retryPolicy, callback=None):
 
         def acked(ack):
-            self.timers.cancel(ack.id, ignoreMissing=True)
+            self._timers.cancel(ack.id, ignoreMissing=True)
             if(not callback is None):
                 callback(self, ack)
 
         def timedOut(packetId, attempt):
             if(retryPolicy.shouldRetry(attempt)):
-                self.timers.create(packetId, retryPolicy.getAckTimeout(attempt), functools.partial(timedOut, packetId, attempt + 1))
+                self._timers.create(packetId, retryPolicy.getAckTimeout(attempt), functools.partial(timedOut, packetId, attempt + 1))
                 self.__write(msg)
             else:
-                logging.error("Ack timed out, retries exhausted: %s" % packetId)
-                self.__close()
+                self._acker.complete(packetId, exception=AckTimeoutException())
 
-        ack = self.acker.create(acked)
+        ack = self._acker.create(acked)
         msg.packetId = ack.id
-        self.timers.create(ack.id, retryPolicy.getAckTimeout(0), functools.partial(timedOut, ack.id, 1))
+        self._timers.create(ack.id, retryPolicy.getAckTimeout(0), functools.partial(timedOut, ack.id, 1))
 
         self.__write(msg)
 
