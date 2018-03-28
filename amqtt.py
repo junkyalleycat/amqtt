@@ -519,7 +519,7 @@ class MqttSession:
         self._timers = Timers(loop)
         self._acker = Acker(self.limits, loop)
 
-    def connect(self, connect):
+    def start(self, connect):
         self.sessionLoop = self._loop.create_task(self.__start(connect))
         return self.sessionLoop
 
